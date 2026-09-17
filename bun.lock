@@ -10703,6 +10703,19 @@
         "vitest": "3.2.6",
       },
     },
+    "packages/pieces/custom/sage-intacct": {
+      "name": "@activepieces/piece-sage-intacct",
+      "version": "0.0.6",
+      "dependencies": {
+        "@activepieces/core-piece-types": "workspace:*",
+        "@activepieces/core-utils": "workspace:*",
+        "@activepieces/pieces-common": "workspace:*",
+        "@activepieces/pieces-framework": "workspace:*",
+      },
+      "devDependencies": {
+        "tslib": "2.6.2",
+      },
+    },
     "packages/pieces/framework": {
       "name": "@activepieces/pieces-framework",
       "version": "0.39.0",
@@ -12307,6 +12320,8 @@
     "@activepieces/piece-saastic": ["@activepieces/piece-saastic@workspace:packages/pieces/community/saastic"],
 
     "@activepieces/piece-sage-accounting": ["@activepieces/piece-sage-accounting@workspace:packages/pieces/community/sage-accounting"],
+
+    "@activepieces/piece-sage-intacct": ["@activepieces/piece-sage-intacct@workspace:packages/pieces/custom/sage-intacct"],
 
     "@activepieces/piece-saleor": ["@activepieces/piece-saleor@workspace:packages/pieces/community/saleor"],
 
