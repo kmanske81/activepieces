@@ -36,7 +36,7 @@ export const ListPlatformAppConnectionsRequestQuery = z.object({
     cursor: z.string().optional(),
     limit: z.coerce.number().optional(),
     displayName: z.string().optional(),
-    pieceName: z.string().optional(),
+    pieceName: OptionalArrayFromQuery(z.string()),
     scope: z.nativeEnum(AppConnectionScope).optional(),
     status: OptionalArrayFromQuery(z.nativeEnum(AppConnectionStatus)),
     projectIds: OptionalArrayFromQuery(z.string()),
@@ -51,8 +51,16 @@ export const PlatformAppConnectionProjectInfo = z.object({
 })
 export type PlatformAppConnectionProjectInfo = z.infer<typeof PlatformAppConnectionProjectInfo>
 
+export const PlatformAppConnectionFlowInfo = z.object({
+    id: z.string(),
+    displayName: z.string(),
+    projectId: z.string(),
+})
+export type PlatformAppConnectionFlowInfo = z.infer<typeof PlatformAppConnectionFlowInfo>
+
 export const PlatformAppConnectionsListItem = AppConnectionWithoutSensitiveData.extend({
     projects: z.array(PlatformAppConnectionProjectInfo),
+    flows: z.array(PlatformAppConnectionFlowInfo),
 })
 export type PlatformAppConnectionsListItem = z.infer<typeof PlatformAppConnectionsListItem>
 
@@ -69,5 +77,12 @@ export const PlatformAppConnectionOwnersResponse = z.object({
     truncated: z.boolean(),
 })
 export type PlatformAppConnectionOwnersResponse = z.infer<typeof PlatformAppConnectionOwnersResponse>
+
+export const PlatformAppConnectionsSummary = z.object({
+    total: z.number(),
+    byStatus: z.record(z.enum(AppConnectionStatus), z.number()),
+    byScope: z.record(z.enum(AppConnectionScope), z.number()),
+})
+export type PlatformAppConnectionsSummary = z.infer<typeof PlatformAppConnectionsSummary>
 
 export const MAX_PLATFORM_APP_CONNECTION_OWNERS = 1000

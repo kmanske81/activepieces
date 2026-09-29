@@ -1,13 +1,15 @@
 import { ActivepiecesError, apId, Cursor, ErrorCode, isNil, Metadata, PlatformId, ProjectId, SeekPage, spreadIfDefined, tryCatch, tryCatchSync, unique, UserId } from '@activepieces/core-utils'
 import { PieceMetadata } from '@activepieces/pieces-framework'
-import { ApEdition, ApEnvironment, AppConnection, AppConnectionId, AppConnectionOwners, AppConnectionScope, AppConnectionStatus, AppConnectionType, AppConnectionValue, AppConnectionWithoutSensitiveData, ConnectionState, EngineResponse, EngineResponseStatus, ExecuteResolveConnectionIdentifierResponse, ExecuteValidateAuthResponse, MAX_PLATFORM_APP_CONNECTION_OWNERS, OAuth2GrantType, PlatformAppConnectionOwner, PlatformAppConnectionOwnersResponse, PlatformAppConnectionProjectInfo, PlatformAppConnectionsListItem, PlatformRole, UpsertAppConnectionRequestBody, WorkerJobType } from '@activepieces/shared'
+import { ApEdition, ApEnvironment, AppConnection, AppConnectionId, AppConnectionOwners, AppConnectionScope, AppConnectionStatus, AppConnectionType, AppConnectionValue, AppConnectionWithoutSensitiveData, ConnectionState, EngineResponse, EngineResponseStatus, ExecuteResolveConnectionIdentifierResponse, ExecuteValidateAuthResponse, FlowOperationStatus, MAX_PLATFORM_APP_CONNECTION_OWNERS, OAuth2GrantType, PlatformAppConnectionFlowInfo, PlatformAppConnectionOwner, PlatformAppConnectionOwnersResponse, PlatformAppConnectionProjectInfo, PlatformAppConnectionsListItem, PlatformAppConnectionsSummary, PlatformRole, UpsertAppConnectionRequestBody, WorkerJobType } from '@activepieces/shared'
 import { FastifyBaseLogger } from 'fastify'
 import semver from 'semver'
-import { ArrayContains, Equal, FindOperator, FindOptionsWhere, ILike, In } from 'typeorm'
+import { ArrayContains, FindOperator, FindOptionsWhere, ILike, In } from 'typeorm'
 import { repoFactory } from '../../core/db/repo-factory'
 import { projectMemberService } from '../../ee/projects/project-members/project-member.service'
 import { containsSecretManagerReference, secretManagersService } from '../../ee/secret-managers/secret-managers.service'
+import { flowRepo } from '../../flows/flow/flow.repo'
 import { flowService } from '../../flows/flow/flow.service'
+import { flowVersionRepo } from '../../flows/flow-version/flow-version.service'
 import { encryptUtils } from '../../helper/encryption'
 import { jwtUtils } from '../../helper/jwt-utils'
 import { buildPaginator } from '../../helper/pagination/build-paginator'
@@ -210,21 +212,22 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
 
     async getOnePublicOrThrow(params: GetOneParams): Promise<AppConnectionWithoutSensitiveData> {
         const connection = await this.getOneOrThrowWithoutValue(params)
-        const flowIdsByExternalId = await fetchFlowIdsForConnections(log, [connection])
+        const usageByConnectionId = await fetchFlowUsageForConnections({ connections: [connection] })
         return {
             ...connection,
-            flowIds: flowIdsByExternalId.get(connection.externalId) ?? [],
+            flowIds: usageByConnectionId.get(connection.id)?.latestFlowIds ?? [],
         }
     },
 
     async revalidate({ id, projectId, platformId }: RevalidateParams): Promise<AppConnectionWithoutSensitiveData> {
         const metadata = await this.getOneOrThrowWithoutValue({ id, projectId, platformId })
+        const validationProjectId = projectId ?? metadata.projectIds[0]
         const connection = await appConnectionHandler(log).revalidateConnection({
             id,
             platformId,
-            projectId,
+            projectId: validationProjectId,
             externalId: metadata.externalId,
-            validate: ({ pieceName, value }) => engineValidateAuth({ pieceName, projectId, platformId, auth: value }, log),
+            validate: ({ pieceName, value }) => engineValidateAuth({ pieceName, projectId: validationProjectId, platformId, auth: value }, log),
             log,
         })
         if (isNil(connection)) {
@@ -409,79 +412,9 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
         log.info({ connection: { id: params.id }, platform: { id: params.platformId } }, 'App connection deleted')
     },
 
-    async list({
-        projectId,
-        projectIds,
-        ownerIds,
-        pieceName,
-        cursorRequest,
-        displayName,
-        status,
-        limit,
-        scope,
-        platformId,
-        externalIds,
-    }: ListParams): Promise<SeekPage<AppConnection>> {
-        const decodedCursor = paginationHelper.decodeCursor(cursorRequest)
-        const paginator = buildPaginator({
-            entity: AppConnectionEntity,
-            query: {
-                limit,
-                order: 'ASC',
-                afterCursor: decodedCursor.nextCursor,
-                beforeCursor: decodedCursor.previousCursor,
-            },
-        })
-
-        const querySelector: Record<string, string | FindOperator<string>> = {
-            ...(projectId ? { projectIds: ArrayContains([projectId]) } : {}),
-            ...spreadIfDefined('scope', scope),
-            platformId,
-        }
-        if (!isNil(pieceName)) {
-            querySelector.pieceName = Equal(pieceName)
-        }
-        if (!isNil(displayName)) {
-            querySelector.displayName = ILike(`%${displayName}%`)
-        }
-        if (!isNil(status)) {
-            querySelector.status = In(status)
-        }
-        if (!isNil(externalIds)) {
-            querySelector.externalId = In(externalIds)
-        }
-        if (!isNil(ownerIds) && ownerIds.length > 0) {
-            querySelector.ownerId = In(ownerIds)
-        }
-        const queryBuilder = appConnectionsRepo()
-            .createQueryBuilder('app_connection')
-            .leftJoinAndSelect('app_connection.owner', 'owner')
-            .leftJoinAndSelect('owner.identity', 'owner_identity')
-            .where(querySelector)
-        if (!isNil(projectIds) && projectIds.length > 0) {
-            queryBuilder.andWhere('app_connection."projectIds" && :projectIds::varchar[]', { projectIds })
-        }
-        const { data, cursor } = await paginator.paginate(queryBuilder)
-
-        const flowIdsByExternalId = await fetchFlowIdsForConnections(log, data)
-
-        const promises = data.map(async (encryptedConnection) => {
-            const apConnection: AppConnection = await appConnectionHandler(log).decryptConnection(encryptedConnection)
-            const owner = mapToUserWithMetaInformation(encryptedConnection.owner)
-            const flowIds = flowIdsByExternalId.get(apConnection.externalId) ?? []
-
-            return {
-                ...apConnection,
-                owner,
-                flowIds,
-            }
-        })
-        const refreshConnections = await Promise.all(promises)
-
-        return paginationHelper.createPage<AppConnection>(
-            refreshConnections,
-            cursor,
-        )
+    async list(params: ListParams): Promise<SeekPage<AppConnection>> {
+        const { page } = await listWithFlows({ log, ...params })
+        return page
     },
     removeSensitiveData: (
         appConnection: AppConnection | AppConnectionSchema,
@@ -543,8 +476,9 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
 
     async listForPlatform(params: ListForPlatformParams): Promise<SeekPage<PlatformAppConnectionsListItem>> {
         const service = appConnectionService(log)
-        const page = await service.list({
-            pieceName: params.pieceName,
+        const { page, usageByConnectionId } = await listWithFlows({
+            log,
+            pieceName: params.pieceNames,
             displayName: params.displayName,
             status: params.status,
             scope: params.scope,
@@ -565,10 +499,36 @@ export const appConnectionService = (log: FastifyBaseLogger) => ({
             const projects: PlatformAppConnectionProjectInfo[] = connection.projectIds
                 .map((id) => projectsById.get(id))
                 .filter((project): project is PlatformAppConnectionProjectInfo => project !== undefined)
-            return { ...sanitized, projects }
+            const flows = usageByConnectionId.get(connection.id)?.flows ?? []
+            return { ...sanitized, projects, flows }
         })
 
         return { ...page, data }
+    },
+
+    async summaryForPlatform({ platformId }: { platformId: PlatformId }): Promise<PlatformAppConnectionsSummary> {
+        const rows = await appConnectionsRepo()
+            .createQueryBuilder('app_connection')
+            .select('app_connection.status', 'status')
+            .addSelect('app_connection.scope', 'scope')
+            .addSelect('COUNT(*)', 'count')
+            .where('app_connection.platformId = :platformId', { platformId })
+            .groupBy('app_connection.status')
+            .addGroupBy('app_connection.scope')
+            .getRawMany<{ status: AppConnectionStatus, scope: AppConnectionScope, count: string }>()
+
+        const summary: PlatformAppConnectionsSummary = {
+            total: 0,
+            byStatus: { [AppConnectionStatus.ACTIVE]: 0, [AppConnectionStatus.MISSING]: 0, [AppConnectionStatus.ERROR]: 0 },
+            byScope: { [AppConnectionScope.PROJECT]: 0, [AppConnectionScope.PLATFORM]: 0 },
+        }
+        rows.forEach(({ status, scope, count }) => {
+            const value = Number(count)
+            summary.total += value
+            summary.byStatus[status] += value
+            summary.byScope[scope] += value
+        })
+        return summary
     },
 
     async listOwnersForPlatform({ platformId }: { platformId: PlatformId }): Promise<PlatformAppConnectionOwnersResponse> {
@@ -897,43 +857,129 @@ const engineResolveConnectionIdentifier = async (
     return identifier ?? undefined
 }
 
-async function fetchFlowIdsForConnections(
-    log: FastifyBaseLogger,
-    connections: Pick<AppConnectionSchema, 'externalId' | 'projectIds'>[],
-): Promise<Map<string, string[]>> {
-    const allExternalIds = new Set<string>()
-    const allProjectIds = new Set<string>()
-    
-    connections.forEach((connection) => {
-        allExternalIds.add(connection.externalId)
-        connection.projectIds.forEach((projectId) => {
-            allProjectIds.add(projectId)
-        })
+async function listWithFlows({
+    log,
+    projectId,
+    projectIds,
+    ownerIds,
+    pieceName,
+    cursorRequest,
+    displayName,
+    status,
+    limit,
+    scope,
+    platformId,
+    externalIds,
+}: ListParams & { log: FastifyBaseLogger }): Promise<{ page: SeekPage<AppConnection>, usageByConnectionId: Map<string, ConnectionFlowUsage> }> {
+    const decodedCursor = paginationHelper.decodeCursor(cursorRequest)
+    const paginator = buildPaginator({
+        entity: AppConnectionEntity,
+        query: {
+            limit,
+            order: 'ASC',
+            afterCursor: decodedCursor.nextCursor,
+            beforeCursor: decodedCursor.previousCursor,
+        },
     })
 
-    if (allExternalIds.size === 0 || allProjectIds.size === 0) {
-        return new Map<string, string[]>()
+    const querySelector: Record<string, string | FindOperator<string>> = {
+        ...(projectId ? { projectIds: ArrayContains([projectId]) } : {}),
+        ...spreadIfDefined('scope', scope),
+        platformId,
     }
+    const pieceNames = [pieceName ?? []].flat()
+    if (pieceNames.length > 0) {
+        querySelector.pieceName = In(pieceNames)
+    }
+    if (!isNil(displayName)) {
+        querySelector.displayName = ILike(`%${displayName}%`)
+    }
+    if (!isNil(status)) {
+        querySelector.status = In(status)
+    }
+    if (!isNil(externalIds)) {
+        querySelector.externalId = In(externalIds)
+    }
+    if (!isNil(ownerIds) && ownerIds.length > 0) {
+        querySelector.ownerId = In(ownerIds)
+    }
+    const queryBuilder = appConnectionsRepo()
+        .createQueryBuilder('app_connection')
+        .leftJoinAndSelect('app_connection.owner', 'owner')
+        .leftJoinAndSelect('owner.identity', 'owner_identity')
+        .where(querySelector)
+    if (!isNil(projectIds) && projectIds.length > 0) {
+        queryBuilder.andWhere('app_connection."projectIds" && :projectIds::varchar[]', { projectIds })
+    }
+    const { data, cursor } = await paginator.paginate(queryBuilder)
 
-    const flowsPage = await flowService(log).list({
-        projectIds: Array.from(allProjectIds),
-        cursorRequest: null,
-        connectionExternalIds: Array.from(allExternalIds),
-    })
+    const usageByConnectionId = await fetchFlowUsageForConnections({ connections: data })
 
-    const flowIdsByExternalId = new Map<string, string[]>()
-    flowsPage.data.forEach((flow) => {
-        if (flow.version?.connectionIds) {
-            flow.version.connectionIds.forEach((connectionExternalId) => {
-                if (!flowIdsByExternalId.has(connectionExternalId)) {
-                    flowIdsByExternalId.set(connectionExternalId, [])
-                }
-                flowIdsByExternalId.get(connectionExternalId)!.push(flow.id)
-            })
+    const promises = data.map(async (encryptedConnection) => {
+        const apConnection: AppConnection = await appConnectionHandler(log).decryptConnection(encryptedConnection)
+        const owner = mapToUserWithMetaInformation(encryptedConnection.owner)
+        const flowIds = usageByConnectionId.get(apConnection.id)?.latestFlowIds ?? []
+
+        return {
+            ...apConnection,
+            owner,
+            flowIds,
         }
     })
+    const refreshConnections = await Promise.all(promises)
 
-    return flowIdsByExternalId
+    return {
+        page: paginationHelper.createPage<AppConnection>(refreshConnections, cursor),
+        usageByConnectionId,
+    }
+}
+
+async function fetchFlowUsageForConnections({ connections }: {
+    connections: Pick<AppConnectionSchema, 'id' | 'externalId' | 'projectIds'>[]
+}): Promise<Map<string, ConnectionFlowUsage>> {
+    const externalIds = unique(connections.map((connection) => connection.externalId))
+    const projectIds = unique(connections.flatMap((connection) => connection.projectIds))
+
+    if (externalIds.length === 0 || projectIds.length === 0) {
+        return new Map<string, ConnectionFlowUsage>()
+    }
+
+    const latestVersionId = flowVersionRepo()
+        .createQueryBuilder('candidate_version')
+        .select('candidate_version.id')
+        .where('candidate_version."flowId" = flow.id')
+        .orderBy('candidate_version.created', 'DESC')
+        .limit(1)
+        .getQuery()
+
+    const rows = await flowRepo()
+        .createQueryBuilder('flow')
+        .innerJoin('project', 'project', 'project.id = flow."projectId" AND project.deleted IS NULL')
+        .leftJoin('flow_version', 'latest_version', `latest_version."flowId" = flow.id AND latest_version.id = (${latestVersionId})`)
+        .leftJoin('flow_version', 'published_version', 'published_version.id = flow."publishedVersionId"')
+        .select('flow.id', 'flowId')
+        .addSelect('flow."projectId"', 'projectId')
+        .addSelect('latest_version."displayName"', 'displayName')
+        .addSelect('latest_version."connectionIds"', 'latestConnectionIds')
+        .addSelect('published_version."connectionIds"', 'publishedConnectionIds')
+        .where('flow."projectId" = ANY(:projectIds)', { projectIds })
+        .andWhere('flow."operationStatus" != :deleting', { deleting: FlowOperationStatus.DELETING })
+        .andWhere('(latest_version."connectionIds" && :externalIds OR published_version."connectionIds" && :externalIds)', { externalIds })
+        .orderBy('latest_version."displayName"', 'ASC')
+        .addOrderBy('flow.id', 'ASC')
+        .getRawMany<FlowUsingConnectionRow>()
+
+    return new Map(connections.map((connection) => {
+        const reachable = new Set(connection.projectIds)
+        const inReach = rows.filter((row) => reachable.has(row.projectId))
+        const flows = inReach
+            .filter((row) => [...(row.latestConnectionIds ?? []), ...(row.publishedConnectionIds ?? [])].includes(connection.externalId))
+            .map((row) => ({ id: row.flowId, displayName: row.displayName ?? '', projectId: row.projectId }))
+        const latestFlowIds = inReach
+            .filter((row) => (row.latestConnectionIds ?? []).includes(connection.externalId))
+            .map((row) => row.flowId)
+        return [connection.id, { flows, latestFlowIds }]
+    }))
 }
 
 function validatePieceVersion(pieceVersion: string): void {
@@ -981,7 +1027,7 @@ type GetManyParams = {
 
 type RevalidateParams = {
     id: AppConnectionId
-    projectId: ProjectId
+    projectId: ProjectId | null
     platformId: PlatformId
 }
 
@@ -1005,7 +1051,7 @@ type ListParams = {
     projectIds?: ProjectId[]
     ownerIds?: string[]
     platformId: string
-    pieceName: string | undefined
+    pieceName: string | string[] | undefined
     cursorRequest: Cursor | null
     scope: AppConnectionScope | undefined
     displayName: string | undefined
@@ -1016,7 +1062,7 @@ type ListParams = {
 
 type ListForPlatformParams = {
     platformId: string
-    pieceName: string | undefined
+    pieceNames: string[] | undefined
     displayName: string | undefined
     status: AppConnectionStatus[] | undefined
     scope: AppConnectionScope | undefined
@@ -1060,3 +1106,15 @@ type ReplaceParams = {
     applyToPublishedVersions: boolean
 }
 
+type ConnectionFlowUsage = {
+    flows: PlatformAppConnectionFlowInfo[]
+    latestFlowIds: string[]
+}
+
+type FlowUsingConnectionRow = {
+    flowId: string
+    projectId: string
+    displayName: string | null
+    latestConnectionIds: string[] | null
+    publishedConnectionIds: string[] | null
+}
